@@ -117,3 +117,43 @@ class FinanceApp:
     if p['debt']>0
       months=int(p['debt']/surplus) if suplus>0 else "Indefinite"
       print("Months until debt-free: {months}")
+
+      #Scenario: If debt is cleared, project 10 years from that point
+    df=self.engine.calculate_projection(0, surplus, 10)
+    self.plot_growth(df)
+
+  def plot_growth(self, df:pd.DataFrame):
+    #Visualizes the 10-years projection
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['Month'], df['NetWoth'], label="WealthGrowth", color='green')
+    plt.title("10-Year Net Worth Projection (Post-debt)")
+    plt.xlabel("Months")
+    plt.ylabel(f"Value({self.profile})")
+    plt.grid(True,linestyle='--', alpha=0.7)
+    plt.legend()
+    plt.show()
+
+if__name__=="__main__":
+  app=FinanceApp()
+
+  while True:
+    print("\n--PERSONAL FINANCE ARCHITECT--")
+    print("1. Setup/Update Profile")
+    print("2. View Monthly Report & Growth Chart")
+    print("3. Run Side-income Scenario")
+    print("4. Exit")
+
+    choice=input("Select an option: ")
+
+    if choice=='1':
+      app.setup_profile()
+    elif choice=='2':
+      app.generate_report()
+    elif choice=='3':
+      side=float(input("Enter potential monthly side-income: ")
+      if app.profile:
+        ScenarioSimulator.run_comparison(app.profile['debt'], app.profile['income'], app.profile['expenses'], side)
+    elif choice=='4':
+      break
+    else:
+      print("Invlaid selection...")
