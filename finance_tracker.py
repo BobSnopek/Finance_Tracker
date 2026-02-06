@@ -1,159 +1,148 @@
 import sqlite3
 import pandas as pd
 import matplotlib.pyplot as plt
-from typing import List, Dict, Optional, Tuple
+import re
+from typing import Optional
 from datetime import datetime
 
-# -- Constants --
-DEFAULT_YIELD = 0.05 # (5% p.a.)
+class InputCleaner:
+    """Utility to scrub user input and return clean numbers."""
+    
+    @staticmethod
+    def clean_to_float(user_input: str) -> float:
+        """Removes all non-numeric characters except the first decimal point."""
+        # Replace comma with dot for decimal consistency
+        sanitized = user_input.replace(',', '.')
+        # Remove everything except digits and the dot
+        sanitized = re.sub(r'[^0-9.]', '', sanitized)
+        
+        try:
+            val = float(sanitized)
+            # Logic for yields: If user enters "9", they likely mean 0.09
+            # We will handle this specific logic in the setup_profile method
+            return val
+        except ValueError:
+            return 0.0
 
 class FinanceDatabase:
-  #Handles SQLite persistence for all financial data.
+    """Handles SQLite persistence."""
+    def __init__(self, db_name: str = "finance_tracker.db"):
+        self.conn = sqlite3.connect(db_name)
+        self._create_tables()
 
-  def__init__(self, db_name: str="finance_tracker.db")
-    self.conn=sqlite3.connect(db_name)
-    self._create_tables()
+    def _create_tables(self):
+        with self.conn:
+            self.conn.execute("""
+                CREATE TABLE IF NOT EXISTS profile (
+                    id INTEGER PRIMARY KEY,
+                    currency TEXT,
+                    total_debt REAL,
+                    monthly_income REAL,
+                    monthly_expenses REAL,
+                    annual_yield REAL,
+                    exchange_rate REAL
+                )
+            """)
 
-  def_create_tables(self):
-    #Initializes the database schema.
-    with self.conn:
-      self.conn.execute("""
-        CREATE TABLE IF NOT EXIST profile (
-          id INTGER PRIMARY KEY,
-          total_debt REAL DEFAULT 0,
-          monthly_income REAL DEFAULT 1000
-          monthly_expenses REAL DEFAULT 500
-        )
-      """)
+    def save_profile(self, data: dict):
+        with self.conn:
+            self.conn.execute("DELETE FROM profile")
+            self.conn.execute("""
+                INSERT INTO profile (currency, total_debt, monthly_income, monthly_expenses, annual_yield, exchange_rate)
+                VALUES (:currency, :debt, :income, :expenses, :yield, :rate)
+            """, data)
 
-  def save_profile(self, debt:float, income:float, expenses:float):
-    with self.conn:
-      self.conn.execute("DELETE FROM profile")
-      self.conn.execute("INSERT INTO profile (total_debt, monthly_income, monthly_expenses) VALUES (?,?,?)", (debt, income, expenses))
-
-  def get_profile(self)->Optional[dict]:
-    cursor=self.conn.cursor()
-    cursor.execute("SELECT total_debt, monthly_income, monthly_expenses FROM profile LIMIT 1")
-    row=cursor.fetchone()
-    if row:
-      return{"debt":row[0],"income":row[1],"expenses":row[2]}
-    return None
-
-class DebtManager:
-  #Manages debt logic and prioritized repayment.
-  def__init__(self,total_debt:float, surplus:float):
-    self.total_debt=total_debt
-    self.surplus=surplus
-
-  def months_to_clear(self)->int:
-    """Calculates months required to reach zero debt."""
-    if self.surplus<=0:
-      return float('inf')
-    return int(self.total_debt / self.surplus)
+    def get_profile(self) -> Optional[dict]:
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM profile LIMIT 1")
+        row = cursor.fetchone()
+        if row:
+            return {
+                "currency": row[1], "debt": row[2], "income": row[3], 
+                "expenses": row[4], "yield": row[5], "rate": row[6]
+            }
+        return None
 
 class InvestmentEngine:
-  """Calculates wealth accumulation via compound interest."""
-  def__init__(self, yield_rate:float=DEFAULT_YIELD):
-    self.annual_yield=yield_rate
-    self.monthly_yield=yield_rate/12
+    def __init__(self, yield_rate: float):
+        self.monthly_yield = yield_rate / 12
 
-  def calculate_projection(self, initial_p:float, monthly_cont:float, years:int=10)->pdDataFrame:
-    """Generation a month-by-month net worth trajectory."""
-    data=[]
-    current_balance=initial_p
-
-    for month in range (1,(years*12)+1):
-      current_balance=(current_balance*(1+self.monthly_yield))+monthly_cont
-      data.append({"Month": month, "NetWorth": round(current_balance,2)})
-
-      return pd.DataFrame(data)
-
-class ScenarioSimulator:
-  #Compares different financial paths(e.g. side-hustle impact)
-  @staticmethod
-  def run_comparison(debt:float, income:float, expenses:float, side_income:float):
-    surplus_standard=income-expenses
-    surplus_boosted=surplus_standard+side_income
-
-    dm_std=DebtManager(debt, surplus_standard)
-    dm_bst=DebtManager(debt, surplus_boosted)
-
-    print(f"\n--SCENARIO COMPARISON--")
-    print(f"Standard: Debt cleared in {dm_std.months_to_clear()} months.")
-    print(f"Boosted: Debt cleared in {dm_bst.months_to_clear()} months.")
-    print(f"Time saved: {dm.std.months_to_clear() - dm_bst.months_to_clear()} months.")
+    def calculate_projection(self, monthly_cont: float, years: int = 10) -> pd.DataFrame:
+        data = []
+        current_balance = 0
+        for month in range(1, (years * 12) + 1):
+            current_balance = (current_balance * (1 + self.monthly_yield)) + monthly_cont
+            data.append({"Month": month, "NetWorth": round(current_balance, 2)})
+        return pd.DataFrame(data)
 
 class FinanceApp:
-  #Main CLI Applocation Controller.
-  def__init__(self):
-    self. db=FinanceDatabase()
-    self.engine=InvestmentEngine()
-    self.profile=self.db.get_profile()
+    def __init__(self):
+        self.db = FinanceDatabase()
+        self.cleaner = InputCleaner()
+        self.profile = self.db.get_profile()
 
-  def setup_profile(self):
-    #User's input for initial financial state:
-    try:
-      print(f"\n--INITIAL SETUP--")
-      debt=float(input("Total Debt Amount"))
-      inc=float(input("Monthly Net Income"))
-      exp=float(input("Monthly Expenses"))
+    def setup_profile(self):
+        print("\n--- Configuration (Press Enter for Defaults) ---")
+        
+        # 1. Currency
+        curr = input("Preferred Currency (EUR/CZK) [Default: CZK]: ").upper() or "CZK"
+        
+        # 2. Exchange Rate
+        raw_rate = input("CZK/EUR Exchange Rate [Default: 25]: ")
+        rate = self.cleaner.clean_to_float(raw_rate) if raw_rate else 25.0
+        
+        # 3. Debt
+        default_debt = 250000 if curr == "CZK" else 10000
+        raw_debt = input(f"Total Debt Amount [Default: {default_debt}]: ")
+        debt = self.cleaner.clean_to_float(raw_debt) if raw_debt else float(default_debt)
+        
+        # 4. Annual Yield
+        raw_yield = input("Annual Interest Rate % (e.g., 9 or 0.05) [Default: 5%]: ")
+        if not raw_yield:
+            y_val = 0.05
+        else:
+            y_val = self.cleaner.clean_to_float(raw_yield)
+            # If user entered "9", convert to 0.09. If "0.09", keep as is.
+            if y_val >= 1:
+                y_val = y_val / 100
 
-      self.db.save_profile(debt,inc,exp)
-      self.profile=self.db.get_profile()
-      print("Profile saved successfully!")
-    except ValueError:
-      print("Error: Please enter valid numeric values.")
+        # 5. Income/Expenses
+        income = self.cleaner.clean_to_float(input("Monthly Net Income: "))
+        expenses = self.cleaner.clean_to_float(input("Monthly Expenses: "))
 
-  def generate_report(self):
-    #Logic for prioritizing debt then investment
-    if not self.profile:
-      print("No profile found. Please, run setup first.")
+        profile_data = {
+            "currency": curr, "debt": debt, "income": income, 
+            "expenses": expenses, "yield": y_val, "rate": rate
+        }
+        
+        self.db.save_profile(profile_data)
+        self.profile = self.db.get_profile()
+        print(f"✅ Profile updated! Yield set to {y_val*100:.1f}%.")
 
-    p=self_profile
-      surplus=p['income']-p['expenses']
+    def run_report(self):
+        if not self.profile:
+            print("Please setup profile first.")
+            return
+        
+        p = self.profile
+        surplus = p['income'] - p['expenses']
+        
+        print(f"\n--- Strategy for {p['currency']} ---")
+        if p['debt'] > 0:
+            months = int(p['debt'] / surplus) if surplus > 0 else "Infinity"
+            print(f"Repaying {p['debt']} debt first. Time: {months} months.")
+        
+        engine = InvestmentEngine(p['yield'])
+        df = engine.calculate_projection(surplus)
+        
+        plt.plot(df['Month'], df['NetWorth'])
+        plt.title(f"10-Year Growth at {p['yield']*100}% p.a.")
+        plt.show()
 
-    print(f"\n--MONTHLY FINANCIAL STATUS--")
-    print(f"Net Surplus:(surplus)")
-    if p['debt']>0
-      months=int(p['debt']/surplus) if suplus>0 else "Indefinite"
-      print("Months until debt-free: {months}")
-
-      #Scenario: If debt is cleared, project 10 years from that point
-    df=self.engine.calculate_projection(0, surplus, 10)
-    self.plot_growth(df)
-
-  def plot_growth(self, df:pd.DataFrame):
-    #Visualizes the 10-years projection
-    plt.figure(figsize=(10, 5))
-    plt.plot(df['Month'], df['NetWoth'], label="WealthGrowth", color='green')
-    plt.title("10-Year Net Worth Projection (Post-debt)")
-    plt.xlabel("Months")
-    plt.ylabel(f"Value({self.profile})")
-    plt.grid(True,linestyle='--', alpha=0.7)
-    plt.legend()
-    plt.show()
-
-if__name__=="__main__":
-  app=FinanceApp()
-
-  while True:
-    print("\n--PERSONAL FINANCE ARCHITECT--")
-    print("1. Setup/Update Profile")
-    print("2. View Monthly Report & Growth Chart")
-    print("3. Run Side-income Scenario")
-    print("4. Exit")
-
-    choice=input("Select an option: ")
-
-    if choice=='1':
-      app.setup_profile()
-    elif choice=='2':
-      app.generate_report()
-    elif choice=='3':
-      side=float(input("Enter potential monthly side-income: ")
-      if app.profile:
-        ScenarioSimulator.run_comparison(app.profile['debt'], app.profile['income'], app.profile['expenses'], side)
-    elif choice=='4':
-      break
-    else:
-      print("Invlaid selection...")
+if __name__ == "__main__":
+    app = FinanceApp()
+    # Simplified menu for this example
+    print("1. Setup | 2. Report")
+    choice = input("> ")
+    if choice == '1': app.setup_profile()
+    else: app.run_report()
