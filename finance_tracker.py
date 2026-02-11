@@ -3,100 +3,90 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import re
 from typing import Optional
-from datetime import datetime
 
 class InputCleaner:
     """Utility to scrub user input and return clean numbers."""
-    
     @staticmethod
     def clean_to_float(user_input: str) -> float:
-        """Removes all non-numeric characters except the first decimal point."""
+        if not user_input.strip():
+            return 0.0
         sanitized = user_input.replace(',', '.')
-        # Keep only first decimal point
         parts = sanitized.split('.')
         if len(parts) > 2:
             sanitized = parts[0] + '.' + ''.join(parts[1:])
-        
         sanitized = re.sub(r'[^0-9.]', '', sanitized)
-        
         try:
             val = float(sanitized)
-            return max(0.0, val)  # Prevent negative values
+            return max(0.0, val)
         except ValueError:
             return 0.0
 
 class FinanceDatabase:
-    """Handles SQLite persistence."""
+    """Handles SQLite persistence with named columns."""
     def __init__(self, db_name: str = "finance_tracker.db"):
-        try:
-            self.conn = sqlite3.connect(db_name)
-            self._create_tables()
-        except sqlite3.Error as e:
-            print(f"Database error: {e}")
-            raise
+        self.conn = sqlite3.connect(db_name)
+        self.conn.row_factory = sqlite3.Row  # Access by column name
+        self._create_tables()
 
     def _create_tables(self):
         with self.conn:
             self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS profile (
                     id INTEGER PRIMARY KEY,
-                    currency TEXT NOT NULL,
-                    total_debt REAL NOT NULL DEFAULT 0,
-                    monthly_income REAL NOT NULL DEFAULT 0,
-                    monthly_expenses REAL NOT NULL DEFAULT 0,
-                    annual_yield REAL NOT NULL DEFAULT 0.05,
-                    exchange_rate REAL NOT NULL DEFAULT 25.0,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    currency TEXT,
+                    total_debt REAL,
+                    monthly_income REAL,
+                    monthly_expenses REAL,
+                    annual_yield REAL,
+                    inflation REAL,
+                    exchange_rate REAL
                 )
             """)
 
     def save_profile(self, data: dict):
-        try:
-            with self.conn:
-                self.conn.execute("DELETE FROM profile")
-                self.conn.execute("""
-                    INSERT INTO profile (currency, total_debt, monthly_income, monthly_expenses, annual_yield, exchange_rate)
-                    VALUES (:currency, :debt, :income, :expenses, :yield, :rate)
-                """, data)
-        except sqlite3.Error as e:
-            print(f"Error saving profile: {e}")
-            raise
+        with self.conn:
+            # Upsert logic: always update record #1
+            self.conn.execute("""
+                INSERT OR REPLACE INTO profile (id, currency, total_debt, monthly_income, monthly_expenses, annual_yield, inflation, exchange_rate)
+                VALUES (1, :currency, :debt, :income, :expenses, :yield, :inflation, :rate)
+            """, data)
 
     def get_profile(self) -> Optional[dict]:
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("SELECT * FROM profile LIMIT 1")
-            row = cursor.fetchone()
-            if row:
-                return {
-                    "currency": row[1], "debt": row[2], "income": row[3], 
-                    "expenses": row[4], "yield": row[5], "rate": row[6]
-                }
-            return None
-        except sqlite3.Error as e:
-            print(f"Error retrieving profile: {e}")
-            return None
-    
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT * FROM profile WHERE id = 1")
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
     def close(self):
-        """Close database connection."""
-        if self.conn:
-            self.conn.close()
+        self.conn.close()
 
 class InvestmentEngine:
-    def __init__(self, yield_rate: float):
-        self.annual_yield = yield_rate
-        self.monthly_yield = yield_rate / 12
+    def __init__(self, nominal_yield: float, inflation: float):
+        # Calculate the "Real" rate of return (Fisher Equation approximation)
+        self.real_annual_yield = nominal_yield - inflation
+        self.monthly_yield = self.real_annual_yield / 12
 
-    def calculate_projection(self, monthly_cont: float, years: int = 10) -> pd.DataFrame:
+    def calculate_projection(self, initial_debt: float, monthly_surplus: float, years: int = 10) -> pd.DataFrame:
         data = []
-        current_balance = 0
-        for month in range(1, (years * 12) + 1):
-            current_balance = (current_balance * (1 + self.monthly_yield)) + monthly_cont
+        current_balance = -initial_debt  # Debt is negative net worth
+        
+        for month in range(0, (years * 12) + 1):
             data.append({
-                "Month": month, 
+                "Month": month,
                 "Year": month / 12,
-                "NetWorth": round(current_balance, 2)
+                "NetWorth": round(current_balance, 2),
+                "Status": "Debt" if current_balance < 0 else "Investing"
             })
+            
+            # Update for next month
+            # While in debt, we assume 0% interest on debt for simplicity 
+            # (or that surplus is just applied to principal).
+            # Once positive, we apply the monthly yield.
+            if current_balance < 0:
+                current_balance += monthly_surplus
+            else:
+                current_balance = (current_balance * (1 + self.monthly_yield)) + monthly_surplus
+                
         return pd.DataFrame(data)
 
 class FinanceApp:
@@ -108,47 +98,29 @@ class FinanceApp:
     def setup_profile(self):
         print("\n--- Configuration (Press Enter for Defaults) ---")
         
-        # 1. Currency
         curr = input("Preferred Currency (EUR/CZK) [Default: CZK]: ").upper() or "CZK"
-        if curr not in ["EUR", "CZK"]:
-            print(f"Warning: Unknown currency '{curr}', using CZK")
-            curr = "CZK"
+        rate = self.cleaner.clean_to_float(input("CZK/EUR Rate [Default: 25]: ") or "25")
+        debt = self.cleaner.clean_to_float(input("Current Total Debt: ") or "0")
         
-        # 2. Exchange Rate
-        raw_rate = input("CZK/EUR Exchange Rate [Default: 25]: ")
-        rate = self.cleaner.clean_to_float(raw_rate) if raw_rate else 25.0
+        # Yield Logic
+        raw_yield = input("Expected Annual Return % (e.g. 7) [Default: 5%]: ")
+        y_val = self.cleaner.clean_to_float(raw_yield) / 100 if raw_yield else 0.05
         
-        # 3. Debt
-        default_debt = 250000 if curr == "CZK" else 10000
-        raw_debt = input(f"Total Debt Amount [Default: {default_debt}]: ")
-        debt = self.cleaner.clean_to_float(raw_debt) if raw_debt else float(default_debt)
+        # Inflation Logic
+        raw_inf = input("Expected Annual Inflation % (e.g. 3) [Default: 4.5%]: ")
+        inf_val = self.cleaner.clean_to_float(raw_inf) / 100 if raw_inf else 0.045
         
-        # 4. Annual Yield
-        raw_yield = input("Annual Interest Rate % (e.g., 9 or 0.05) [Default: 5%]: ")
-        if not raw_yield:
-            y_val = 0.05
-        else:
-            y_val = self.cleaner.clean_to_float(raw_yield)
-            if y_val >= 1:
-                y_val = y_val / 100
-            if y_val > 1:  # Still too high after conversion
-                print(f"Warning: {y_val*100}% seems unusually high")
-
-        # 5. Income/Expenses
         income = self.cleaner.clean_to_float(input("Monthly Net Income: "))
         expenses = self.cleaner.clean_to_float(input("Monthly Expenses: "))
         
-        if expenses > income:
-            print("⚠️  Warning: Expenses exceed income!")
-
         profile_data = {
             "currency": curr, "debt": debt, "income": income, 
-            "expenses": expenses, "yield": y_val, "rate": rate
+            "expenses": expenses, "yield": y_val, "inflation": inf_val, "rate": rate
         }
         
         self.db.save_profile(profile_data)
         self.profile = self.db.get_profile()
-        print(f"✅ Profile updated! Yield set to {y_val*100:.1f}%.")
+        print(f"✅ Profile updated! Real return: {(y_val - inf_val)*100:.1f}%")
 
     def run_report(self):
         if not self.profile:
@@ -156,72 +128,69 @@ class FinanceApp:
             return
         
         p = self.profile
-        surplus = p['income'] - p['expenses']
-        
-        print(f"\n--- Financial Strategy Report ({p['currency']}) ---")
-        print(f"Monthly Surplus: {surplus:,.2f} {p['currency']}")
-        
-        if p['debt'] > 0:
-            if surplus > 0:
-                months_to_payoff = p['debt'] / surplus
-                years_to_payoff = months_to_payoff / 12
-                print(f"Debt Repayment: {p['debt']:,.2f} {p['currency']}")
-                print(f"Time to Pay Off: {months_to_payoff:.1f} months ({years_to_payoff:.1f} years)")
-            else:
-                print(f"⚠️  Cannot repay debt of {p['debt']:,.2f} with no surplus!")
-                return
+        surplus = p['monthly_income'] - p['monthly_expenses']
         
         if surplus <= 0:
-            print("⚠️  No surplus available for investment projections.")
+            print(f"⚠️ Warning: No surplus (Income: {p['monthly_income']} - Expenses: {p['monthly_expenses']})")
             return
+
+        engine = InvestmentEngine(p['annual_yield'], p['inflation'])
+        df = engine.calculate_projection(p['total_debt'], surplus)
         
-        engine = InvestmentEngine(p['yield'])
-        df = engine.calculate_projection(surplus)
+        # Visualization
+        plt.figure(figsize=(12, 6))
         
-        # Enhanced plotting
-        plt.figure(figsize=(10, 6))
-        plt.plot(df['Year'], df['NetWorth'], linewidth=2)
-        plt.title(f"10-Year Investment Growth at {p['yield']*100:.1f}% Annual Return", fontsize=14)
-        plt.xlabel("Years", fontsize=12)
-        plt.ylabel(f"Net Worth ({p['currency']})", fontsize=12)
-        plt.grid(True, alpha=0.3)
+        # Split data for coloring
+        debt_df = df[df['Status'] == "Debt"]
+        inv_df = df[df['Status'] == "Investing"]
+
+        if not debt_df.empty:
+            plt.plot(debt_df['Year'], debt_df['NetWorth'], color='#e74c3c', label='Debt Repayment', linewidth=3)
+        if not inv_df.empty:
+            # Connect the last debt point to the first investment point
+            plot_df = df[df['NetWorth'] >= -surplus] 
+            plt.plot(plot_df['Year'], plot_df['NetWorth'], color='#2ecc71', label='Wealth Building', linewidth=3)
+
+        plt.axhline(0, color='black', linestyle='--', alpha=0.3)
+        plt.title(f"10-Year Financial Path ({p['currency']})\nNominal: {p['annual_yield']*100}% | Inflation: {p['inflation']*100}%", fontsize=14)
+        plt.xlabel("Years")
+        plt.ylabel(f"Net Worth ({p['currency']})")
+        plt.legend()
+        plt.grid(True, alpha=0.2)
         
-        # Format y-axis as currency
-        ax = plt.gca()
-        ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
+        # Formatting y-axis
+        plt.gca().yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:,.0f}'))
         
-        # Add final value annotation
-        final_value = df['NetWorth'].iloc[-1]
-        plt.annotate(f'Final: {final_value:,.0f}', 
-                    xy=(10, final_value), 
-                    xytext=(8, final_value * 0.9),
-                    arrowprops=dict(arrowstyle='->', color='red'))
+        final_val = df['NetWorth'].iloc[-1]
+        plt.annotate(f'Final: {final_val:,.0f}', xy=(10, final_val), xytext=(8.5, final_val*0.8),
+                     arrowprops=dict(facecolor='black', shrink=0.05))
         
         plt.tight_layout()
         plt.show()
-        
-        print(f"\n📊 Projected net worth after 10 years: {final_value:,.2f} {p['currency']}")
-    
+
+        print(f"\n📊 Report for the next 10 years:")
+        print(f"Monthly Surplus: {surplus:,.2f} {p['currency']}")
+        if p['total_debt'] > 0:
+            months = p['total_debt'] / surplus
+            print(f"Debt-Free In: {months:.1f} months ({months/12:.1f} years)")
+        print(f"Projected Net Worth (Inflation Adjusted): {final_val:,.2f} {p['currency']}")
+
     def cleanup(self):
-        """Clean up resources."""
         self.db.close()
 
 if __name__ == "__main__":
     app = FinanceApp()
     try:
-        print("=" * 50)
-        print("  Personal Finance Tracker")
-        print("=" * 50)
-        print("\n1. Setup Profile | 2. View Report | 3. Exit")
-        choice = input("> ").strip()
-        
-        if choice == '1': 
-            app.setup_profile()
-        elif choice == '2': 
-            app.run_report()
-        elif choice == '3':
-            print("Goodbye!")
-        else:
-            print("Invalid choice")
+        while True:
+            print("\n" + "="*40)
+            print("  PERSONAL FINANCE TRACKER (v2.0)")
+            print("="*40)
+            print("1. Setup Profile\n2. View Report\n3. Exit")
+            choice = input("> ").strip()
+            
+            if choice == '1': app.setup_profile()
+            elif choice == '2': app.run_report()
+            elif choice == '3': break
+            else: print("Invalid choice.")
     finally:
         app.cleanup()
